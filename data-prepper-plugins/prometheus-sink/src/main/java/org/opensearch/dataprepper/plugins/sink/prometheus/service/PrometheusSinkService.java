@@ -27,6 +27,8 @@ import org.opensearch.dataprepper.model.metric.JacksonGauge;
 import org.opensearch.dataprepper.model.metric.JacksonHistogram;
 import org.opensearch.dataprepper.model.metric.JacksonSum;
 import org.opensearch.dataprepper.model.metric.JacksonSummary;
+import org.opensearch.dataprepper.model.metric.Quantile;
+import org.opensearch.dataprepper.model.metric.Bucket;
 import org.opensearch.dataprepper.model.record.Record;
 
 import org.opensearch.dataprepper.plugins.certificate.s3.CertificateProviderFactory;
@@ -34,6 +36,9 @@ import org.opensearch.dataprepper.plugins.sink.prometheus.FailedHttpResponseInte
 import org.opensearch.dataprepper.plugins.sink.prometheus.HttpEndPointResponse;
 import org.opensearch.dataprepper.plugins.sink.prometheus.OAuthAccessTokenManager;
 import org.opensearch.dataprepper.plugins.sink.prometheus.certificate.HttpClientSSLConnectionManager;
+import org.opensearch.dataprepper.plugins.sink.prometheus.client.RemoteWriteClient;
+import org.opensearch.dataprepper.plugins.sink.prometheus.client.RemoteWriteClientFactory;
+import org.opensearch.dataprepper.plugins.sink.prometheus.client.RemoteWriteResponse;
 import org.opensearch.dataprepper.plugins.sink.prometheus.configuration.AuthTypeOptions;
 import org.opensearch.dataprepper.plugins.sink.prometheus.configuration.HTTPMethodOptions;
 import org.opensearch.dataprepper.plugins.sink.prometheus.configuration.PrometheusSinkConfiguration;
@@ -44,6 +49,7 @@ import org.opensearch.dataprepper.plugins.sink.prometheus.handler.BearerTokenAut
 import org.opensearch.dataprepper.plugins.sink.prometheus.handler.HttpAuthOptions;
 import org.opensearch.dataprepper.plugins.sink.prometheus.handler.MultiAuthPrometheusSinkHandler;
 import org.opensearch.dataprepper.plugins.sink.prometheus.util.PrometheusSinkUtil;
+import org.opensearch.dataprepper.plugins.sink.prometheus.util.PrometheusSanitizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xerial.snappy.Snappy;
@@ -99,6 +105,8 @@ public class PrometheusSinkService {
 
     private MultiAuthPrometheusSinkHandler multiAuthPrometheusSinkHandler;
 
+    private final RemoteWriteClient remoteWriteClient;
+
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
     private static final Pattern PREFIX_PATTERN = Pattern.compile("^[^a-zA-Z_:]");
@@ -143,6 +151,13 @@ public class PrometheusSinkService {
         this.prometheusSinkRecordsSuccessCounter = pluginMetrics.counter(PROMETHEUS_SINK_RECORDS_SUCCESS_COUNTER);
         this.prometheusSinkRecordsFailedCounter = pluginMetrics.counter(PROMETHEUS_SINK_RECORDS_FAILED_COUNTER);
         this.httpAuthOptions = buildAuthHttpSinkObjectsByConfig(prometheusSinkConfiguration);
+        
+        // Initialize the dedicated RemoteWriteClient with proper configuration
+        this.remoteWriteClient = RemoteWriteClientFactory.createClient(
+            prometheusSinkConfiguration, 
+            httpClientConnectionManager, 
+            pluginMetrics
+        );
     }
 
     /**
@@ -159,42 +174,47 @@ public class PrometheusSinkService {
                     Remote.WriteRequest message = null;
                     if (event instanceof JacksonGauge) {
                         final JacksonGauge jacksonGauge = (JacksonGauge) event;
-                        message = buildRemoteWriteRequest(jacksonGauge.getTime(),
-                                jacksonGauge.getStartTime(), jacksonGauge.getValue(), jacksonGauge.getAttributes(),jacksonGauge.getName());
+                        message = buildGaugeWriteRequest(jacksonGauge);
                     } else if (event instanceof JacksonSum) {
                         final JacksonSum jacksonSum = (JacksonSum) event;
-                        message = buildRemoteWriteRequest(jacksonSum.getTime(),
-                                jacksonSum.getStartTime(), jacksonSum.getValue(), jacksonSum.getAttributes(), jacksonSum.getName());
+                        message = buildSumWriteRequest(jacksonSum);
                     } else if (event instanceof JacksonSummary) {
                         final JacksonSummary jacksonSummary = (JacksonSummary) event;
-                        message = buildRemoteWriteRequest(jacksonSummary.getTime(),
-                                jacksonSummary.getStartTime(), jacksonSummary.getSum(), jacksonSummary.getAttributes(), jacksonSummary.getName());
+                        message = buildSummaryWriteRequest(jacksonSummary);
                     } else if (event instanceof JacksonHistogram) {
                         final JacksonHistogram jacksonHistogram = (JacksonHistogram) event;
-                        message = buildRemoteWriteRequest(jacksonHistogram.getTime(),
-                                jacksonHistogram.getStartTime(), jacksonHistogram.getSum(), jacksonHistogram.getAttributes(), jacksonHistogram.getName());
+                        message = buildHistogramWriteRequest(jacksonHistogram);
                     } else if (event instanceof JacksonExponentialHistogram) {
                         final JacksonExponentialHistogram jacksonExpHistogram = (JacksonExponentialHistogram) event;
-                        message = buildRemoteWriteRequest(jacksonExpHistogram.getTime(),
-                                jacksonExpHistogram.getStartTime(), jacksonExpHistogram.getSum(), jacksonExpHistogram.getAttributes(), jacksonExpHistogram.getName());
+                        message = buildExponentialHistogramWriteRequest(jacksonExpHistogram);
                     } else {
                         LOG.error("No valid Event type found");
                     }
-                    if( message.toByteArray() != null)
+                    if( message != null && message.toByteArray() != null)
                         bytes = message.toByteArray();
                 }
                 if (event.getEventHandle() != null) {
                     this.bufferedEventHandles.add(event.getEventHandle());
                 }
-                if(bytes != null){
-                    HttpEndPointResponse failedHttpEndPointResponses = pushToEndPoint(bytes);
-
-                    if (failedHttpEndPointResponses != null) {
-                        logFailedData(failedHttpEndPointResponses);
-                        releaseEventHandles(Boolean.FALSE);
-                    } else {
-                        LOG.info("data pushed to the end point successfully");
+                if(message != null){
+                    // Use the dedicated RemoteWriteClient with built-in retry logic and error handling
+                    RemoteWriteResponse response = remoteWriteClient.send(message);
+                    
+                    if (response.isSuccess()) {
+                        LOG.debug("Remote write request sent successfully");
                         releaseEventHandles(Boolean.TRUE);
+                    } else {
+                        LOG.error("Failed to send remote write request: {}", response.getErrorMessage());
+                        
+                        // Convert RemoteWriteResponse to HttpEndPointResponse for DLQ compatibility
+                        HttpEndPointResponse failedResponse = new HttpEndPointResponse(
+                            prometheusSinkConfiguration.getUrl(), 
+                            response.getStatusCode(), 
+                            response.getErrorMessage()
+                        );
+                        
+                        logFailedData(failedResponse);
+                        releaseEventHandles(Boolean.FALSE);
                     }
                 }});
 
@@ -213,7 +233,8 @@ public class PrometheusSinkService {
      */
     private static Remote.WriteRequest buildRemoteWriteRequest(final String time, final String startTime,
                                                                final Double value, final Map<String, Object> attributeMap, final String metricName) {
-        final Remote.WriteRequest.Builder writeRequestBuilder = Remote.WriteRequest.newBuilder();
+final Remote.WriteRequest.Builder writeRequestBuilder = Remote.WriteRequest.newBuilder();
+writeRequestBuilder.addAllMetadata(buildMetadata(event));
 
         final Types.TimeSeries.Builder timeSeriesBuilder = Types.TimeSeries.newBuilder();
 
@@ -236,15 +257,363 @@ public class PrometheusSinkService {
         timeSeriesBuilder.addAllLabels(arrayList);
         timeSeriesBuilder.addAllSamples(Arrays.asList(prometheusSample));
 
-        final Types.TimeSeries timeSeries = timeSeriesBuilder.build();
-        writeRequestBuilder.addAllTimeseries(Arrays.asList(timeSeries));
+// Add exemplars to timeSeriesBuilder
+addExemplarsToTimeSeries(event, timeSeriesBuilder);
+writeRequestBuilder.addAllTimeseries(Arrays.asList(timeSeriesBuilder.build()));
 
         return writeRequestBuilder.build();
     }
 
+    /**
+     * Build WriteRequest for Gauge metrics
+     * @param gauge JacksonGauge metric
+     * @return Remote.WriteRequest
+     */
+    private Remote.WriteRequest buildGaugeWriteRequest(final JacksonGauge gauge) {
+        return buildRemoteWriteRequest(gauge.getTime(), gauge.getStartTime(), 
+                gauge.getValue(), gauge.getAttributes(), PrometheusSanitizer.sanitizeMetricName(gauge.getName()));
+    }
+
+    /**
+     * Build WriteRequest for Sum metrics with proper cumulative/delta handling
+     * @param sum JacksonSum metric
+     * @return Remote.WriteRequest
+     */
+    private Remote.WriteRequest buildSumWriteRequest(final JacksonSum sum) {
+        String metricName = sum.getName();
+        
+        // For monotonic counters, ensure _total suffix for Prometheus compatibility
+        if (sum.isMonotonic() && !metricName.endsWith("_total")) {
+            metricName = metricName + "_total";
+        }
+        
+        return buildRemoteWriteRequest(sum.getTime(), sum.getStartTime(), 
+                sum.getValue(), sum.getAttributes(), PrometheusSanitizer.sanitizeMetricName(metricName));
+    }
+
+    /**
+     * Build WriteRequest for Summary metrics with quantiles handling
+     * @param summary JacksonSummary metric
+     * @return Remote.WriteRequest
+     */
+    private Remote.WriteRequest buildSummaryWriteRequest(final JacksonSummary summary) {
+        final Remote.WriteRequest.Builder writeRequestBuilder = Remote.WriteRequest.newBuilder();
+        final List<Types.TimeSeries> timeSeriesList = new ArrayList<>();
+        
+        final String baseName = summary.getName();
+        final long timestamp = getTimeStampVal(summary.getTime() != null ? summary.getTime() : summary.getStartTime());
+        
+        // Create quantile time series
+        if (summary.getQuantiles() != null) {
+            for (final var quantile : summary.getQuantiles()) {
+                final List<Types.Label> labels = new ArrayList<>();
+                setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName), labels);
+                prepareLabelList(summary.getAttributes(), labels);
+                
+                // Add quantile label
+                labels.add(Types.Label.newBuilder()
+                        .setName("quantile")
+                        .setValue(String.valueOf(quantile.getQuantile()))
+                        .build());
+                
+                final Types.Sample sample = Types.Sample.newBuilder()
+                        .setValue(quantile.getValue())
+                        .setTimestamp(timestamp)
+                        .build();
+                
+                timeSeriesList.add(Types.TimeSeries.newBuilder()
+                        .addAllLabels(labels)
+                        .addSamples(sample)
+                        .build());
+            }
+        }
+        
+        // Create _sum time series
+        if (summary.getSum() != null) {
+            final List<Types.Label> sumLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_sum"), sumLabels);
+            prepareLabelList(summary.getAttributes(), sumLabels);
+            
+            final Types.Sample sumSample = Types.Sample.newBuilder()
+                    .setValue(summary.getSum())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(sumLabels)
+                    .addSamples(sumSample)
+                    .build());
+        }
+        
+        // Create _count time series
+        if (summary.getCount() != null) {
+            final List<Types.Label> countLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_count"), countLabels);
+            prepareLabelList(summary.getAttributes(), countLabels);
+            
+            final Types.Sample countSample = Types.Sample.newBuilder()
+                    .setValue(summary.getCount().doubleValue())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(countLabels)
+                    .addSamples(countSample)
+                    .build());
+        }
+        
+        writeRequestBuilder.addAllTimeseries(timeSeriesList);
+        return writeRequestBuilder.build();
+    }
+
+    /**
+     * Build WriteRequest for Histogram metrics with buckets handling
+     * @param histogram JacksonHistogram metric
+     * @return Remote.WriteRequest
+     */
+    private Remote.WriteRequest buildHistogramWriteRequest(final JacksonHistogram histogram) {
+        final Remote.WriteRequest.Builder writeRequestBuilder = Remote.WriteRequest.newBuilder();
+        final List<Types.TimeSeries> timeSeriesList = new ArrayList<>();
+        
+        final String baseName = histogram.getName();
+        final long timestamp = getTimeStampVal(histogram.getTime() != null ? histogram.getTime() : histogram.getStartTime());
+        
+        // Create bucket time series
+        if (histogram.getBuckets() != null && histogram.getExplicitBoundsList() != null) {
+            final List<Double> bounds = histogram.getExplicitBoundsList();
+            final List<? extends org.opensearch.dataprepper.model.metric.Bucket> buckets = histogram.getBuckets();
+            
+            for (int i = 0; i < bounds.size() && i < buckets.size(); i++) {
+                final List<Types.Label> bucketLabels = new ArrayList<>();
+                setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_bucket"), bucketLabels);
+                prepareLabelList(histogram.getAttributes(), bucketLabels);
+                
+                // Add 'le' (less than or equal) label for bucket boundary
+                final String leValue = bounds.get(i).equals(Double.POSITIVE_INFINITY) ? "+Inf" : String.valueOf(bounds.get(i));
+                bucketLabels.add(Types.Label.newBuilder()
+                        .setName("le")
+                        .setValue(leValue)
+                        .build());
+                
+                final Types.Sample bucketSample = Types.Sample.newBuilder()
+                        .setValue(buckets.get(i).getCount().doubleValue())
+                        .setTimestamp(timestamp)
+                        .build();
+                
+                timeSeriesList.add(Types.TimeSeries.newBuilder()
+                        .addAllLabels(bucketLabels)
+                        .addSamples(bucketSample)
+                        .build());
+            }
+            
+            // Always add +Inf bucket if not present
+            boolean hasInfBucket = bounds.stream().anyMatch(bound -> bound.equals(Double.POSITIVE_INFINITY));
+            if (!hasInfBucket) {
+                final List<Types.Label> infBucketLabels = new ArrayList<>();
+                setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_bucket"), infBucketLabels);
+                prepareLabelList(histogram.getAttributes(), infBucketLabels);
+                
+                infBucketLabels.add(Types.Label.newBuilder()
+                        .setName("le")
+                        .setValue("+Inf")
+                        .build());
+                
+                final Types.Sample infBucketSample = Types.Sample.newBuilder()
+                        .setValue(histogram.getCount() != null ? histogram.getCount().doubleValue() : 0.0)
+                        .setTimestamp(timestamp)
+                        .build();
+                
+                timeSeriesList.add(Types.TimeSeries.newBuilder()
+                        .addAllLabels(infBucketLabels)
+                        .addSamples(infBucketSample)
+                        .build());
+            }
+        }
+        
+        // Create _sum time series
+        if (histogram.getSum() != null) {
+            final List<Types.Label> sumLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_sum"), sumLabels);
+            prepareLabelList(histogram.getAttributes(), sumLabels);
+            
+            final Types.Sample sumSample = Types.Sample.newBuilder()
+                    .setValue(histogram.getSum())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(sumLabels)
+                    .addSamples(sumSample)
+                    .build());
+        }
+        
+        // Create _count time series
+        if (histogram.getCount() != null) {
+            final List<Types.Label> countLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_count"), countLabels);
+            prepareLabelList(histogram.getAttributes(), countLabels);
+            
+            final Types.Sample countSample = Types.Sample.newBuilder()
+                    .setValue(histogram.getCount().doubleValue())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(countLabels)
+                    .addSamples(countSample)
+                    .build());
+        }
+        
+        writeRequestBuilder.addAllTimeseries(timeSeriesList);
+        return writeRequestBuilder.build();
+    }
+
+    /**
+     * Build WriteRequest for ExponentialHistogram metrics with conversion to classical buckets
+     * @param expHistogram JacksonExponentialHistogram metric
+     * @return Remote.WriteRequest
+     */
+    private Remote.WriteRequest buildExponentialHistogramWriteRequest(final JacksonExponentialHistogram expHistogram) {
+        final Remote.WriteRequest.Builder writeRequestBuilder = Remote.WriteRequest.newBuilder();
+        final List<Types.TimeSeries> timeSeriesList = new ArrayList<>();
+        
+        final String baseName = expHistogram.getName();
+        final long timestamp = getTimeStampVal(expHistogram.getTime() != null ? expHistogram.getTime() : expHistogram.getStartTime());
+        
+        // Convert exponential histogram to classical histogram buckets
+        final List<ConvertedBucket> convertedBuckets = convertExponentialToBuckets(expHistogram);
+        
+        // Create bucket time series
+        for (final ConvertedBucket bucket : convertedBuckets) {
+            final List<Types.Label> bucketLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_bucket"), bucketLabels);
+            prepareLabelList(expHistogram.getAttributes(), bucketLabels);
+            
+            // Add 'le' label for bucket boundary
+            bucketLabels.add(Types.Label.newBuilder()
+                    .setName("le")
+                    .setValue(bucket.upperBound)
+                    .build());
+            
+            final Types.Sample bucketSample = Types.Sample.newBuilder()
+                    .setValue(bucket.cumulativeCount)
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(bucketLabels)
+                    .addSamples(bucketSample)
+                    .build());
+        }
+        
+        // Create _sum time series
+        if (expHistogram.getSum() != null) {
+            final List<Types.Label> sumLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_sum"), sumLabels);
+            prepareLabelList(expHistogram.getAttributes(), sumLabels);
+            
+            final Types.Sample sumSample = Types.Sample.newBuilder()
+                    .setValue(expHistogram.getSum())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(sumLabels)
+                    .addSamples(sumSample)
+                    .build());
+        }
+        
+        // Create _count time series
+        if (expHistogram.getCount() != null) {
+            final List<Types.Label> countLabels = new ArrayList<>();
+            setMetricName(PrometheusSanitizer.sanitizeMetricName(baseName + "_count"), countLabels);
+            prepareLabelList(expHistogram.getAttributes(), countLabels);
+            
+            final Types.Sample countSample = Types.Sample.newBuilder()
+                    .setValue(expHistogram.getCount().doubleValue())
+                    .setTimestamp(timestamp)
+                    .build();
+            
+            timeSeriesList.add(Types.TimeSeries.newBuilder()
+                    .addAllLabels(countLabels)
+                    .addSamples(countSample)
+                    .build());
+        }
+        
+        writeRequestBuilder.addAllTimeseries(timeSeriesList);
+        return writeRequestBuilder.build();
+    }
+
+    /**
+     * Convert exponential histogram to classical histogram buckets
+     * @param expHistogram exponential histogram to convert
+     * @return list of converted buckets
+     */
+    private List<ConvertedBucket> convertExponentialToBuckets(final JacksonExponentialHistogram expHistogram) {
+        final List<ConvertedBucket> buckets = new ArrayList<>();
+        final Integer scale = expHistogram.getScale();
+        final Double base = scale != null ? Math.pow(2.0, Math.pow(2.0, -scale)) : 2.0;
+        
+        long cumulativeCount = 0L;
+        
+        // Add zero bucket if present
+        if (expHistogram.getZeroCount() != null && expHistogram.getZeroCount() > 0) {
+            final Double zeroThreshold = expHistogram.getZeroThreshold() != null ? expHistogram.getZeroThreshold() : 0.0;
+            cumulativeCount += expHistogram.getZeroCount();
+            buckets.add(new ConvertedBucket(String.valueOf(zeroThreshold), cumulativeCount));
+        }
+        
+        // Convert negative buckets
+        if (expHistogram.getNegative() != null && expHistogram.getNegativeOffset() != null) {
+            final List<Long> negativeCounts = expHistogram.getNegative();
+            final int negativeOffset = expHistogram.getNegativeOffset();
+            
+            for (int i = 0; i < negativeCounts.size(); i++) {
+                final int bucketIndex = negativeOffset + i;
+                final double upperBound = -Math.pow(base, bucketIndex);
+                cumulativeCount += negativeCounts.get(i);
+                buckets.add(new ConvertedBucket(String.valueOf(upperBound), cumulativeCount));
+            }
+        }
+        
+        // Convert positive buckets
+        if (expHistogram.getPositive() != null && expHistogram.getPositiveOffset() != null) {
+            final List<Long> positiveCounts = expHistogram.getPositive();
+            final int positiveOffset = expHistogram.getPositiveOffset();
+            
+            for (int i = 0; i < positiveCounts.size(); i++) {
+                final int bucketIndex = positiveOffset + i;
+                final double upperBound = Math.pow(base, bucketIndex);
+                cumulativeCount += positiveCounts.get(i);
+                buckets.add(new ConvertedBucket(String.valueOf(upperBound), cumulativeCount));
+            }
+        }
+        
+        // Always add +Inf bucket with total count
+        final Long totalCount = expHistogram.getCount();
+        if (totalCount != null) {
+            buckets.add(new ConvertedBucket("+Inf", totalCount));
+        }
+        
+        return buckets;
+    }
+
+    /**
+     * Helper class for converted exponential histogram buckets
+     */
+    private static class ConvertedBucket {
+        final String upperBound;
+        final long cumulativeCount;
+        
+        ConvertedBucket(String upperBound, long cumulativeCount) {
+            this.upperBound = upperBound;
+            this.cumulativeCount = cumulativeCount;
+        }
+    }
+
     private static void prepareLabelList(final Map<String, Object> hashMap, final List<Types.Label> arrayList) {
         for (final Map.Entry<String, Object> entry : hashMap.entrySet()) {
-            final String key = sanitizeName(entry.getKey());
+            final String key = PrometheusSanitizer.sanitizeLabelName(entry.getKey());
             final Object value = entry.getValue();
             if (entry.getValue() instanceof Map) {
                 final Object innerMap = entry.getValue();
@@ -252,7 +621,7 @@ public class PrometheusSinkService {
                 continue;
             }
             final Types.Label.Builder labelBuilder = Types.Label.newBuilder();
-            labelBuilder.setName(key).setValue(value.toString());
+            labelBuilder.setName(key).setValue(PrometheusSanitizer.sanitizeLabelValue(value.toString()));
             final Types.Label label = labelBuilder.build();
             arrayList.add(label);
         }
@@ -265,13 +634,17 @@ public class PrometheusSinkService {
     }
 
     private static long getTimeStampVal(final String time) {
+        if (time == null) {
+            return System.currentTimeMillis();
+        }
         long timeStampVal = 0;
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
         try {
             Date date = sdf.parse(time);
             timeStampVal = date.getTime();
         } catch (ParseException e) {
-            e.printStackTrace();
+            LOG.warn("Failed to parse timestamp '{}', using current time", time, e);
+            timeStampVal = System.currentTimeMillis();
         }
         return timeStampVal;
     }
@@ -450,5 +823,19 @@ public class PrometheusSinkService {
         labelBuilder.setName("__name__").setValue(metricName);
         final Types.Label label = labelBuilder.build();
         arrayList.add(label);
+    }
+    
+    /**
+     * Clean up resources when the service is shutdown
+     */
+    public void shutdown() {
+        try {
+            if (remoteWriteClient != null) {
+                remoteWriteClient.close();
+                LOG.info("RemoteWriteClient closed successfully");
+            }
+        } catch (IOException e) {
+            LOG.error("Error closing RemoteWriteClient during shutdown", e);
+        }
     }
 }
